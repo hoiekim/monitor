@@ -223,7 +223,10 @@ async function handleRequest(req, res) {
     const rawUrl = req.url ?? "/";
     const url = new URL(rawUrl, `http://localhost`);
     const pathname = url.pathname;
-    // Health endpoint — no auth required
+    if (!isAuthenticated(req)) {
+        sendJson(res, 401, { error: "Unauthorized" });
+        return;
+    }
     if (pathname === "/health") {
         sendJson(res, 200, {
             status: "ok",
@@ -231,10 +234,6 @@ async function handleRequest(req, res) {
             health: healthState,
             uptime: process.uptime(),
         });
-        return;
-    }
-    if (!isAuthenticated(req)) {
-        sendJson(res, 401, { error: "Unauthorized" });
         return;
     }
     // GET /containers — list running containers
