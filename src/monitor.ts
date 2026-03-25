@@ -371,6 +371,11 @@ async function handleRequest(
 
     try {
       const stream = await dockerStream(path);
+
+      // Close the Docker socket when the HTTP client disconnects.
+      // Without this, the Docker stream stays open and accumulates FDs.
+      req.on("close", () => stream.destroy());
+
       stream.on("data", (chunk: Buffer) => {
         res.write(stripDockerFraming(chunk));
       });
