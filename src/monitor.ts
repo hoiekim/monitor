@@ -268,7 +268,10 @@ function stripDockerFraming(buf: Buffer): Buffer {
 }
 
 function isAuthenticated(req: http.IncomingMessage): boolean {
-  if (!LOG_SERVER_TOKEN) return true; // open in dev
+  if (!LOG_SERVER_TOKEN) {
+    console.error("[security] LOG_SERVER_TOKEN is not set — all authenticated endpoints are blocked");
+    return false; // fail closed
+  }
   return req.headers.authorization === `Bearer ${LOG_SERVER_TOKEN}`;
 }
 
@@ -338,10 +341,14 @@ async function handleRequest(
     return;
   }
 
-  // GET /logs/:container
+  // GET /logs/:container — restricted to MONITOR_TARGETS
   const logsMatch = /^\/logs\/([^/]+)$/.exec(pathname);
   if (logsMatch && req.method === "GET") {
-    const container = logsMatch[1];
+    const container = logsMatch[1] ?? "";
+    if (!MONITOR_TARGETS.includes(container)) {
+      sendJson(res, 403, { error: "Container not in MONITOR_TARGETS" });
+      return;
+    }
     const tail = parseInt(url.searchParams.get("tail") ?? "100", 10);
     const path = `/containers/${container}/logs?stdout=1&stderr=1&tail=${tail}&timestamps=1`;
 
