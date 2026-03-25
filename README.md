@@ -13,10 +13,11 @@ Single-file prod monitor managed by pm2. Four responsibilities in one process:
 cp .env.example .env
 # edit .env — set DISCORD_ALARM_WEBHOOK, LOG_SERVER_TOKEN, MONITOR_TARGETS
 
-bun install
 pm2 start ecosystem.config.js
 pm2 save
 ```
+
+No install step needed — `monitor.js` is plain Node.js with no dependencies.
 
 ## Log Server API
 

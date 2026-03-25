@@ -3,9 +3,8 @@ module.exports = {
   apps: [
     {
       name: "monitor",
-      script: "bun",
-      args: "src/monitor.ts",
-      interpreter: "none",
+      script: "monitor.js",
+      interpreter: "node",
       autorestart: true,
       watch: false,
       max_memory_restart: "100M",
