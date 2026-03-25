@@ -201,7 +201,7 @@ async function watchEvents(): Promise<void> {
 
     // Docker event stream sends one JSON object per line
     let buf = "";
-    stream.on("data", async (chunk: Buffer) => {
+    stream.on("data", (chunk: Buffer) => {
       buf += chunk.toString();
       const lines = buf.split("\n");
       buf = lines.pop() ?? "";
@@ -217,11 +217,13 @@ async function watchEvents(): Promise<void> {
           if (CRASH_EVENTS.has(action) && MONITOR_TARGETS.includes(name)) {
             const exitCode = event.Actor?.Attributes?.exitCode ?? "?";
             console.error(`[events] ${name}: ${action} (exit=${exitCode})`);
-            await sendAlarm(
+            sendAlarm(
               "CRASH",
               name,
               `Container \`${action}\` event (exit code: \`${exitCode}\`)`
-            );
+            ).catch((e: unknown) => {
+              console.error("[events] sendAlarm failed:", e instanceof Error ? e.message : String(e));
+            });
           }
         } catch {
           // partial JSON or non-event line
@@ -291,7 +293,14 @@ interface ContainerListItem {
 
 const server = http.createServer(
   (req: http.IncomingMessage, res: http.ServerResponse) => {
-    void handleRequest(req, res);
+    handleRequest(req, res).catch((e: unknown) => {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error("[server] unhandled error:", msg);
+      try {
+        if (!res.headersSent) sendJson(res, 500, { error: "Internal server error" });
+        else res.end();
+      } catch { /* socket already gone */ }
+    });
   }
 );
 
@@ -300,7 +309,13 @@ async function handleRequest(
   res: http.ServerResponse
 ): Promise<void> {
   const rawUrl = req.url ?? "/";
-  const url = new URL(rawUrl, `http://localhost`);
+  let url: URL;
+  try {
+    url = new URL(rawUrl, "http://localhost");
+  } catch {
+    sendJson(res, 400, { error: "Bad request" });
+    return;
+  }
   const pathname = url.pathname;
 
   // Health endpoint — no auth required
