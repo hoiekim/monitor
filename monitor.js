@@ -5,7 +5,7 @@
  * Responsibilities:
  *   1. Discord alarm trigger — webhook on any error/crash/health failure
  *   2. Healthcheck polling — Docker socket, GET /containers/{name}/json every 60s
- *   3. Docker event capture — die/kill/oom events via Docker socket event stream
+ *   3. Docker event capture — die/oom events via Docker socket event stream (kill events ignored)
  *   4. Log server — read-only HTTP API backed by Docker socket
  *
  * All four run in one process, managed by pm2 on the host.
@@ -137,13 +137,18 @@ async function pollHealth() {
 // ---------------------------------------------------------------------------
 // Docker event stream (#3)
 // ---------------------------------------------------------------------------
-const CRASH_EVENTS = new Set(["die", "kill", "oom"]);
+// Exit codes that indicate a clean/intentional stop, not a crash:
+//   0   — process exited cleanly (handled SIGTERM gracefully)
+//   137 — killed by SIGKILL (128+9), e.g. docker compose up -d replacing a container
+//   143 — killed by SIGTERM (128+15), e.g. docker stop / compose graceful shutdown
+// Any other non-zero exit code is treated as a crash and triggers an alarm.
+const GRACEFUL_EXIT_CODES = new Set([0, 137, 143]);
 async function watchEvents() {
     try {
         const stream = await dockerStream("/events");
         // Docker event stream sends one JSON object per line
         let buf = "";
-        stream.on("data", async (chunk) => {
+        stream.on("data", (chunk) => {
             buf += chunk.toString();
             const lines = buf.split("\n");
             buf = lines.pop() ?? "";
@@ -154,10 +159,32 @@ async function watchEvents() {
                     const event = JSON.parse(line);
                     const action = event.Action;
                     const name = event.Actor?.Attributes?.name ?? "";
-                    if (CRASH_EVENTS.has(action) && MONITOR_TARGETS.includes(name)) {
-                        const exitCode = event.Actor?.Attributes?.exitCode ?? "?";
-                        console.error(`[events] ${name}: ${action} (exit=${exitCode})`);
-                        await sendAlarm("CRASH", name, `Container \`${action}\` event (exit code: \`${exitCode}\`)`);
+                    // Only process "die" and "oom" events for monitored containers.
+                    // "die" carries the real exit code; "kill" fires before the process exits
+                    // and always lacks an exit code — using it caused false alarms on deployments.
+                    // "oom" has no exit code but always signals a real crash (kernel OOM kill).
+                    if (!MONITOR_TARGETS.includes(name))
+                        continue;
+                    if (action === "oom") {
+                        console.error(`[events] ${name}: OOM kill`);
+                        sendAlarm("CRASH", name, "Container killed by OOM killer").catch((e) => {
+                            console.error("[events] sendAlarm failed:", e instanceof Error ? e.message : String(e));
+                        });
+                        continue;
+                    }
+                    if (action === "die") {
+                        const exitCodeRaw = event.Actor?.Attributes?.exitCode;
+                        const exitCode = exitCodeRaw !== undefined ? parseInt(exitCodeRaw, 10) : NaN;
+                        const isGraceful = !isNaN(exitCode) && GRACEFUL_EXIT_CODES.has(exitCode);
+                        if (isGraceful) {
+                            console.log(`[events] ${name}: die (exit=${exitCode}) — graceful stop, no alarm`);
+                            continue;
+                        }
+                        const exitDisplay = isNaN(exitCode) ? "?" : String(exitCode);
+                        console.error(`[events] ${name}: die (exit=${exitDisplay}) — crash`);
+                        sendAlarm("CRASH", name, `Container exited unexpectedly (exit code: \`${exitDisplay}\`)`).catch((e) => {
+                            console.error("[events] sendAlarm failed:", e instanceof Error ? e.message : String(e));
+                        });
                     }
                 }
                 catch {
@@ -167,17 +194,17 @@ async function watchEvents() {
         });
         stream.on("end", () => {
             console.error("[events] stream ended, reconnecting in 5s...");
-            setTimeout(() => void watchEvents(), 5_000);
+            setTimeout(() => void watchEvents(), 5000);
         });
         stream.on("error", (e) => {
             console.error("[events] stream error:", e.message, "— reconnecting in 5s");
-            setTimeout(() => void watchEvents(), 5_000);
+            setTimeout(() => void watchEvents(), 5000);
         });
     }
     catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         console.error("[events] connect failed:", msg, "— retrying in 5s");
-        setTimeout(() => void watchEvents(), 5_000);
+        setTimeout(() => void watchEvents(), 5000);
     }
 }
 // ---------------------------------------------------------------------------
@@ -217,11 +244,28 @@ function sendJson(res, status, body) {
     res.end(payload);
 }
 const server = http_1.default.createServer((req, res) => {
-    void handleRequest(req, res);
+    handleRequest(req, res).catch((e) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error("[server] unhandled error:", msg);
+        try {
+            if (!res.headersSent)
+                sendJson(res, 500, { error: "Internal server error" });
+            else
+                res.end();
+        }
+        catch { /* socket already gone */ }
+    });
 });
 async function handleRequest(req, res) {
     const rawUrl = req.url ?? "/";
-    const url = new URL(rawUrl, `http://localhost`);
+    let url;
+    try {
+        url = new URL(rawUrl, "http://localhost");
+    }
+    catch {
+        sendJson(res, 400, { error: "Bad request" });
+        return;
+    }
     const pathname = url.pathname;
     if (!isAuthenticated(req)) {
         sendJson(res, 401, { error: "Unauthorized" });
@@ -268,6 +312,9 @@ async function handleRequest(req, res) {
         res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
         try {
             const stream = await dockerStream(path);
+            // Close the Docker socket when the HTTP client disconnects.
+            // Without this, the Docker stream stays open and accumulates FDs.
+            req.on("close", () => stream.destroy());
             stream.on("data", (chunk) => {
                 res.write(stripDockerFraming(chunk));
             });

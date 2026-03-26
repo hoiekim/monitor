@@ -4,7 +4,7 @@
  * Responsibilities:
  *   1. Discord alarm trigger — webhook on any error/crash/health failure
  *   2. Healthcheck polling — Docker socket, GET /containers/{name}/json every 60s
- *   3. Docker event capture — die/kill/oom events via Docker socket event stream
+ *   3. Docker event capture — die/oom events via Docker socket event stream (kill events ignored)
  *   4. Log server — read-only HTTP API backed by Docker socket
  *
  * All four run in one process, managed by pm2 on the host.
@@ -193,7 +193,12 @@ async function pollHealth(): Promise<void> {
 // Docker event stream (#3)
 // ---------------------------------------------------------------------------
 
-const CRASH_EVENTS = new Set(["die", "kill", "oom"]);
+// Exit codes that indicate a clean/intentional stop, not a crash:
+//   0   — process exited cleanly (handled SIGTERM gracefully)
+//   137 — killed by SIGKILL (128+9), e.g. docker compose up -d replacing a container
+//   143 — killed by SIGTERM (128+15), e.g. docker stop / compose graceful shutdown
+// Any other non-zero exit code is treated as a crash and triggers an alarm.
+const GRACEFUL_EXIT_CODES = new Set([0, 137, 143]);
 
 async function watchEvents(): Promise<void> {
   try {
@@ -214,13 +219,39 @@ async function watchEvents(): Promise<void> {
           };
           const action = event.Action;
           const name = event.Actor?.Attributes?.name ?? "";
-          if (CRASH_EVENTS.has(action) && MONITOR_TARGETS.includes(name)) {
-            const exitCode = event.Actor?.Attributes?.exitCode ?? "?";
-            console.error(`[events] ${name}: ${action} (exit=${exitCode})`);
+
+          // Only process "die" and "oom" events for monitored containers.
+          // "die" carries the real exit code; "kill" fires before the process exits
+          // and always lacks an exit code — using it caused false alarms on deployments.
+          // "oom" has no exit code but always signals a real crash (kernel OOM kill).
+          if (!MONITOR_TARGETS.includes(name)) continue;
+
+          if (action === "oom") {
+            console.error(`[events] ${name}: OOM kill`);
+            sendAlarm("CRASH", name, "Container killed by OOM killer").catch(
+              (e: unknown) => {
+                console.error("[events] sendAlarm failed:", e instanceof Error ? e.message : String(e));
+              }
+            );
+            continue;
+          }
+
+          if (action === "die") {
+            const exitCodeRaw = event.Actor?.Attributes?.exitCode;
+            const exitCode = exitCodeRaw !== undefined ? parseInt(exitCodeRaw, 10) : NaN;
+            const isGraceful = !isNaN(exitCode) && GRACEFUL_EXIT_CODES.has(exitCode);
+
+            if (isGraceful) {
+              console.log(`[events] ${name}: die (exit=${exitCode}) — graceful stop, no alarm`);
+              continue;
+            }
+
+            const exitDisplay = isNaN(exitCode) ? "?" : String(exitCode);
+            console.error(`[events] ${name}: die (exit=${exitDisplay}) — crash`);
             sendAlarm(
               "CRASH",
               name,
-              `Container \`${action}\` event (exit code: \`${exitCode}\`)`
+              `Container exited unexpectedly (exit code: \`${exitDisplay}\`)`
             ).catch((e: unknown) => {
               console.error("[events] sendAlarm failed:", e instanceof Error ? e.message : String(e));
             });
