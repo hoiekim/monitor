@@ -70,7 +70,7 @@ async function sendAlarm(type, service, detail) {
         return; // cooldown active
     }
     lastAlarmAt[key] = now;
-    const emoji = type === "RECOVERY" ? "✅" : type === "HEALTHCHECK" ? "⚠️" : "🚨";
+    const emoji = type === "RECOVERY" ? "✅" : type === "RESTARTING" ? "🔄" : type === "HEALTHCHECK" ? "⚠️" : "🚨";
     const content = [
         `${emoji} **[${type}]** \`${service}\``,
         `⏰ ${new Date().toISOString()}`,
@@ -121,9 +121,10 @@ async function pollHealth() {
                 }
             }
             else if (current === "starting") {
-                // Container restarted — reset the HEALTHCHECK cooldown so the next
-                // unhealthy poll fires an alarm immediately regardless of cooldown window.
+                // Container restarted — fire a RESTARTING alarm and reset the HEALTHCHECK
+                // cooldown so the next unhealthy poll fires immediately.
                 console.log(`[health] ${name}: restarting (prev=${prev})`);
+                await sendAlarm("RESTARTING", name, `Container restarting after \`${prev}\``);
                 delete lastAlarmAt[`HEALTHCHECK:${name}`];
                 healthFailCount[name] = 0;
             }
