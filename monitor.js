@@ -120,7 +120,14 @@ async function pollHealth() {
                     await sendAlarm("HEALTHCHECK", name, `Health status: \`${current}\``);
                 }
             }
+            else if (current === "starting") {
+                // Container restarted — keep healthFailCount so the next unhealthy
+                // cycle fires immediately without waiting for the threshold again.
+                // Do NOT fire RECOVERY; starting is not a recovery.
+                console.log(`[health] ${name}: restarting (prev=${prev}, failCount=${healthFailCount[name] ?? 0})`);
+            }
             else {
+                // healthy (or unknown state)
                 if ((healthFailCount[name] ?? 0) >= HEALTH_FAIL_THRESHOLD && prev === "unhealthy" && current === "healthy") {
                     console.log(`[health] ${name}: recovered → ${current}`);
                     await sendAlarm("RECOVERY", name, `Health restored: \`${current}\``);
