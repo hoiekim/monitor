@@ -102,7 +102,7 @@ async function sendAlarm(
   lastAlarmAt[key] = now;
 
   const emoji =
-    type === "RECOVERY" ? "✅" : type === "HEALTHCHECK" ? "⚠️" : "🚨";
+    type === "RECOVERY" ? "✅" : type === "RESTARTING" ? "🔄" : type === "HEALTHCHECK" ? "⚠️" : "🚨";
   const content = [
     `${emoji} **[${type}]** \`${service}\``,
     `⏰ ${new Date().toISOString()}`,
@@ -175,8 +175,16 @@ async function pollHealth(): Promise<void> {
           console.error(`[health] ${name}: UNHEALTHY (count=${healthFailCount[name]})`);
           await sendAlarm("HEALTHCHECK", name, `Health status: \`${current}\``);
         }
+      } else if (current === "starting") {
+        // Container restarted — fire a RESTARTING alarm and reset the HEALTHCHECK
+        // cooldown so the next unhealthy poll fires immediately.
+        console.log(`[health] ${name}: restarting (prev=${prev})`);
+        await sendAlarm("RESTARTING", name, `Container restarting after \`${prev}\``);
+        delete lastAlarmAt[`HEALTHCHECK:${name}`];
+        healthFailCount[name] = 0;
       } else {
-        if ((healthFailCount[name] ?? 0) >= HEALTH_FAIL_THRESHOLD && prev === "unhealthy") {
+        // healthy (or unknown state)
+        if ((healthFailCount[name] ?? 0) >= HEALTH_FAIL_THRESHOLD && prev === "unhealthy" && current === "healthy") {
           console.log(`[health] ${name}: recovered → ${current}`);
           await sendAlarm("RECOVERY", name, `Health restored: \`${current}\``);
         }
