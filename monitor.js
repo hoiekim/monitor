@@ -121,7 +121,7 @@ async function pollHealth() {
                 }
             }
             else {
-                if ((healthFailCount[name] ?? 0) >= HEALTH_FAIL_THRESHOLD && prev === "unhealthy") {
+                if ((healthFailCount[name] ?? 0) >= HEALTH_FAIL_THRESHOLD && prev === "unhealthy" && current === "healthy") {
                     console.log(`[health] ${name}: recovered → ${current}`);
                     await sendAlarm("RECOVERY", name, `Health restored: \`${current}\``);
                 }

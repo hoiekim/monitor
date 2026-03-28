@@ -176,7 +176,7 @@ async function pollHealth(): Promise<void> {
           await sendAlarm("HEALTHCHECK", name, `Health status: \`${current}\``);
         }
       } else {
-        if ((healthFailCount[name] ?? 0) >= HEALTH_FAIL_THRESHOLD && prev === "unhealthy") {
+        if ((healthFailCount[name] ?? 0) >= HEALTH_FAIL_THRESHOLD && prev === "unhealthy" && current === "healthy") {
           console.log(`[health] ${name}: recovered → ${current}`);
           await sendAlarm("RECOVERY", name, `Health restored: \`${current}\``);
         }
