@@ -1,11 +1,12 @@
 # monitor
 
-Single-file prod monitor managed by pm2. Four responsibilities in one process:
+Single-file prod monitor managed by pm2. Five responsibilities in one process:
 
 1. **Discord alarm** — webhook on crash, health failure, or recovery
 2. **Healthcheck polling** — Docker socket `/containers/{name}/json` every 60s
 3. **Docker event capture** — `die`/`kill`/`oom` events via Docker event stream
 4. **Log server** — read-only HTTP API backed by Docker socket
+5. **Pre-deploy log persistence** — dumps container logs to disk on graceful shutdown (CD deploys)
 
 ## Setup
 
@@ -42,6 +43,8 @@ Auth: `Authorization: Bearer $LOG_SERVER_TOKEN`
 | `HEALTH_FAIL_THRESHOLD` | no | `1` | Failures before alarm |
 | `ALARM_COOLDOWN_MS` | no | `60000` | Cooldown between same alarms |
 | `DOCKER_SOCKET` | no | `/var/run/docker.sock` | Docker socket path |
+| `PRE_DEPLOY_LOG_DIR` | no | `/var/log/monitor-predeploy` | Directory for pre-deploy log dumps |
+| `PRE_DEPLOY_LOG_TAIL` | no | `500` | Lines to save per container on graceful stop |
 
 ## Design Doc
 
