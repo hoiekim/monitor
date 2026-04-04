@@ -20,6 +20,8 @@ module.exports = {
         HEALTH_FAIL_THRESHOLD: process.env.HEALTH_FAIL_THRESHOLD || "1",
         ALARM_COOLDOWN_MS: process.env.ALARM_COOLDOWN_MS || "60000",
         DOCKER_SOCKET: process.env.DOCKER_SOCKET || "/var/run/docker.sock",
+        PRE_DEPLOY_LOG_DIR: process.env.PRE_DEPLOY_LOG_DIR || "/var/log/monitor-predeploy",
+        PRE_DEPLOY_LOG_TAIL: process.env.PRE_DEPLOY_LOG_TAIL || "500",
       },
     },
   ],

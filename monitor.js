@@ -7,13 +7,16 @@
  *   2. Healthcheck polling — Docker socket, GET /containers/{name}/json every 60s
  *   3. Docker event capture — die/oom events via Docker socket event stream (kill events ignored)
  *   4. Log server — read-only HTTP API backed by Docker socket
+ *   5. Pre-deploy log persistence — dumps container logs to disk before graceful shutdown (CD deploy)
  *
- * All four run in one process, managed by pm2 on the host.
+ * All five run in one process, managed by pm2 on the host.
  */
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+const fs_1 = __importDefault(require("fs"));
+const path_1 = __importDefault(require("path"));
 const http_1 = __importDefault(require("http"));
 const https_1 = __importDefault(require("https"));
 // ---------------------------------------------------------------------------
@@ -30,6 +33,8 @@ const HEALTH_POLL_INTERVAL_MS = parseInt(process.env.HEALTH_POLL_INTERVAL_MS ?? 
 const ALARM_COOLDOWN_MS = parseInt(process.env.ALARM_COOLDOWN_MS ?? "60000", 10);
 const LOG_PORT = parseInt(process.env.LOG_PORT ?? "9000", 10);
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET ?? "/var/run/docker.sock";
+const PRE_DEPLOY_LOG_DIR = process.env.PRE_DEPLOY_LOG_DIR ?? "/var/log/monitor-predeploy";
+const PRE_DEPLOY_LOG_TAIL = parseInt(process.env.PRE_DEPLOY_LOG_TAIL ?? "500", 10);
 function dockerRequest(method, path) {
     return new Promise((resolve, reject) => {
         const req = http_1.default.request({ socketPath: DOCKER_SOCKET, method, path }, (res) => {
@@ -56,6 +61,30 @@ function dockerStream(path) {
         req.on("error", reject);
         req.end();
     });
+}
+// ---------------------------------------------------------------------------
+// Docker log framing (shared utility)
+// ---------------------------------------------------------------------------
+/**
+ * Docker log stream uses a multiplexed framing format:
+ *   [stream_type(1)] [0(3)] [size(4 BE)] [payload(size)]
+ * Strip headers so callers receive plain text.
+ */
+function stripDockerFraming(buf) {
+    const parts = [];
+    let offset = 0;
+    while (offset + 8 <= buf.length) {
+        const size = buf.readUInt32BE(offset + 4);
+        if (size === 0) {
+            offset += 8;
+            continue;
+        }
+        if (offset + 8 + size > buf.length)
+            break;
+        parts.push(buf.subarray(offset + 8, offset + 8 + size));
+        offset += 8 + size;
+    }
+    return parts.length > 0 ? Buffer.concat(parts) : buf;
 }
 // ---------------------------------------------------------------------------
 // Discord alarm
@@ -144,6 +173,47 @@ async function pollHealth() {
     }
 }
 // ---------------------------------------------------------------------------
+// Pre-deploy log persistence (#5)
+// ---------------------------------------------------------------------------
+/**
+ * Dump the last N log lines for a container to disk before it is removed.
+ * Called synchronously from the "die" handler when we detect a graceful stop
+ * (exit codes 137/143 = deployment replacement). The container process has exited
+ * but the container object still exists briefly — Docker logs remain readable.
+ *
+ * Files are written to PRE_DEPLOY_LOG_DIR as:
+ *   <container>-<ISO-timestamp>.log
+ */
+async function savePreDeployLogs(container) {
+    try {
+        fs_1.default.mkdirSync(PRE_DEPLOY_LOG_DIR, { recursive: true });
+    }
+    catch (e) {
+        console.error(`[predeploy] mkdir ${PRE_DEPLOY_LOG_DIR} failed:`, e instanceof Error ? e.message : String(e));
+        return;
+    }
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const filename = `${container}-${ts}.log`;
+    const filepath = path_1.default.join(PRE_DEPLOY_LOG_DIR, filename);
+    const logPath = `/containers/${container}/logs?stdout=1&stderr=1&tail=${PRE_DEPLOY_LOG_TAIL}&timestamps=1`;
+    try {
+        const stream = await dockerStream(logPath);
+        const chunks = [];
+        await new Promise((resolve, reject) => {
+            stream.on("data", (chunk) => chunks.push(chunk));
+            stream.on("end", resolve);
+            stream.on("error", reject);
+        });
+        const raw = Buffer.concat(chunks);
+        const text = stripDockerFraming(raw).toString("utf8");
+        fs_1.default.writeFileSync(filepath, text, "utf8");
+        console.log(`[predeploy] saved ${PRE_DEPLOY_LOG_TAIL} lines for ${container} → ${filepath}`);
+    }
+    catch (e) {
+        console.error(`[predeploy] failed to save logs for ${container}:`, e instanceof Error ? e.message : String(e));
+    }
+}
+// ---------------------------------------------------------------------------
 // Docker event stream (#3)
 // ---------------------------------------------------------------------------
 // Exit codes that indicate a clean/intentional stop, not a crash:
@@ -186,7 +256,10 @@ async function watchEvents() {
                         const exitCode = exitCodeRaw !== undefined ? parseInt(exitCodeRaw, 10) : NaN;
                         const isGraceful = !isNaN(exitCode) && GRACEFUL_EXIT_CODES.has(exitCode);
                         if (isGraceful) {
-                            console.log(`[events] ${name}: die (exit=${exitCode}) — graceful stop, no alarm`);
+                            console.log(`[events] ${name}: die (exit=${exitCode}) — graceful stop, saving pre-deploy logs`);
+                            savePreDeployLogs(name).catch((e) => {
+                                console.error("[events] savePreDeployLogs failed:", e instanceof Error ? e.message : String(e));
+                            });
                             continue;
                         }
                         const exitDisplay = isNaN(exitCode) ? "?" : String(exitCode);
@@ -219,27 +292,6 @@ async function watchEvents() {
 // ---------------------------------------------------------------------------
 // Log server (#4)
 // ---------------------------------------------------------------------------
-/**
- * Docker log stream uses a multiplexed framing format:
- *   [stream_type(1)] [0(3)] [size(4 BE)] [payload(size)]
- * Strip headers so callers receive plain text.
- */
-function stripDockerFraming(buf) {
-    const parts = [];
-    let offset = 0;
-    while (offset + 8 <= buf.length) {
-        const size = buf.readUInt32BE(offset + 4);
-        if (size === 0) {
-            offset += 8;
-            continue;
-        }
-        if (offset + 8 + size > buf.length)
-            break;
-        parts.push(buf.subarray(offset + 8, offset + 8 + size));
-        offset += 8 + size;
-    }
-    return parts.length > 0 ? Buffer.concat(parts) : buf;
-}
 function isAuthenticated(req) {
     if (!LOG_SERVER_TOKEN) {
         console.error("[security] LOG_SERVER_TOKEN is not set — all authenticated endpoints are blocked");
