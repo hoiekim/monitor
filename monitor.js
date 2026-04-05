@@ -255,14 +255,17 @@ async function watchEvents() {
                         const exitCodeRaw = event.Actor?.Attributes?.exitCode;
                         const exitCode = exitCodeRaw !== undefined ? parseInt(exitCodeRaw, 10) : NaN;
                         const isGraceful = !isNaN(exitCode) && GRACEFUL_EXIT_CODES.has(exitCode);
+                        const exitDisplay = isNaN(exitCode) ? "?" : String(exitCode);
+                        // Save logs on every die (graceful or crash) — covers both planned deploys
+                        // and unexpected crashes. OOM kills also emit a subsequent "die" event, so
+                        // log saving is handled here and skipped in the "oom" handler.
+                        savePreDeployLogs(name).catch((e) => {
+                            console.error("[events] savePreDeployLogs failed:", e instanceof Error ? e.message : String(e));
+                        });
                         if (isGraceful) {
-                            console.log(`[events] ${name}: die (exit=${exitCode}) — graceful stop, saving pre-deploy logs`);
-                            savePreDeployLogs(name).catch((e) => {
-                                console.error("[events] savePreDeployLogs failed:", e instanceof Error ? e.message : String(e));
-                            });
+                            console.log(`[events] ${name}: die (exit=${exitCode}) — graceful stop, no alarm`);
                             continue;
                         }
-                        const exitDisplay = isNaN(exitCode) ? "?" : String(exitCode);
                         console.error(`[events] ${name}: die (exit=${exitDisplay}) — crash`);
                         sendAlarm("CRASH", name, `Container exited unexpectedly (exit code: \`${exitDisplay}\`)`).catch((e) => {
                             console.error("[events] sendAlarm failed:", e instanceof Error ? e.message : String(e));
