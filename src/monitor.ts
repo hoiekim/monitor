@@ -21,10 +21,10 @@
 import http from "http";
 import https from "https";
 import { spawn } from "child_process";
-import { appendFileSync, existsSync, mkdirSync, readFile, readFileSync, readdirSync, unlink, unlinkSync, writeFile } from "fs";
+import { appendFileSync, existsSync, mkdirSync, readFile, readFileSync, readdirSync, renameSync, unlink, unlinkSync, writeFile, writeFileSync } from "fs";
 import { randomBytes, timingSafeEqual } from "crypto";
 import { dirname, isAbsolute, join } from "path";
-import { gzip, gunzipSync } from "zlib";
+import { gzip, gzipSync, gunzipSync } from "zlib";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -1119,10 +1119,11 @@ function queryStats(container: string, spanMs: number, endMs: number): { points:
 }
 
 /**
- * Rebuild open buckets after a (re)start from the tier below: the
- * current window's children are already on disk (raw samples for the
- * 10s tier, finalized child points above that), so a restart loses
- * nothing — the partial windows resume exactly. Runs bottom-up.
+ * Rebuild open buckets after a (re)start from the tier below, and
+ * finalize windows that fully elapsed while down (see
+ * finalizeElapsedWindows): the current window's children are already
+ * on disk (raw samples for the 10s tier, finalized child points above
+ * that), so the partial window resumes exactly. Runs bottom-up.
  */
 function rebuildOpenBuckets(): void {
   let containers: string[];
@@ -1135,6 +1136,7 @@ function rebuildOpenBuckets(): void {
   }
   const now = Date.now();
   for (const name of containers) {
+    finalizeElapsedWindows(name, now);
     const buckets: (StatsBucket | null)[] = STATS_TIERS.map(() => null);
     openBuckets[name] = buckets;
     const w0 = Math.floor(now / STATS_TIERS[0].windowMs) * STATS_TIERS[0].windowMs;
@@ -1159,6 +1161,146 @@ function rebuildOpenBuckets(): void {
       for (const p of children) feedBucket(bucket, pointToAgg(p));
       buckets[i] = bucket;
     }
+  }
+}
+
+/**
+ * Newest persisted point of one tier, or null when the tier holds
+ * nothing: scan segment files newest-first so a restart after a long
+ * outage doesn't re-read the tier's whole retention. Points append in
+ * window order, so the first non-empty file holds the latest point.
+ */
+function latestPersistedTs(name: string, tier: StatsTier, now: number): number | null {
+  const retentionMs = tier.retentionDays * 86_400_000;
+  const files = listSegments(name, tier.key, tier.fileSpanMs, now - retentionMs, now);
+  for (let k = files.length - 1; k >= 0; k--) {
+    const points = parsePoints([files[k]], isValidRollupPoint, 0, now);
+    if (points.length === 0) continue;
+    let latest = 0;
+    for (const p of points) latest = Math.max(latest, Date.parse(p.ts));
+    return latest;
+  }
+  return null;
+}
+
+/**
+ * Append one rollup point the way finalizeTierBucket does, except a
+ * period whose segment is already gzipped gets the point merged into
+ * the .gz: reads prefer .gz, so a plain append to a resurrected .jsonl
+ * would be invisible. The merge writes a temp file and renames it
+ * over the .gz, so a kill mid-write leaves the old .gz intact and an
+ * orphan .tmp the readers ignore. Never throws.
+ */
+function appendRollupPointAllowingGzip(name: string, tier: StatsTier, point: StatsRollupPoint): void {
+  const tsMs = Date.parse(point.ts);
+  if (!Number.isFinite(tsMs)) return;
+  const periodStart = Math.floor(tsMs / tier.fileSpanMs) * tier.fileSpanMs;
+  const path = segmentPath(name, tier.key, periodStart, tier.fileSpanMs);
+  const gzPath = `${path}.gz`;
+  if (!existsSync(gzPath)) {
+    appendRollupPoint(name, tier, point);
+    return;
+  }
+  try {
+    const line = JSON.stringify(point);
+    const seen = new Set<string>();
+    const lines: string[] = [];
+    const files = [gzPath];
+    if (existsSync(path)) files.push(path);
+    for (const file of files) {
+      for (const existing of readSegmentLines(file)) {
+        if (seen.has(existing)) continue;
+        seen.add(existing);
+        lines.push(existing);
+      }
+    }
+    if (!seen.has(line)) lines.push(line);
+    const tmpPath = `${gzPath}.tmp`;
+    writeFileSync(tmpPath, gzipSync(lines.join("\n") + "\n"));
+    renameSync(tmpPath, gzPath);
+    try {
+      unlinkSync(path);
+    } catch {
+      /* a leftover .jsonl beside the .gz is ignored by reads */
+    }
+  } catch (e: unknown) {
+    console.warn("[stats] gzipped segment merge failed:", e instanceof Error ? e.message : String(e));
+  }
+}
+
+/**
+ * Finalize windows that fully elapsed while the process was down,
+ * bottom-up: a window's children are already on disk (raw samples for
+ * the 10s tier, finalized child points above that), so the point is
+ * rebuilt exactly as the live cascade would have built it. A window
+ * already stored is skipped, which makes repeated restarts
+ * idempotent; a window with no children gets no point, as live.
+ * Runs before the open-bucket rebuild, so the tiers above see the
+ * recovered points on disk. I/O failures warn and skip, as elsewhere
+ * in the store.
+ */
+function finalizeElapsedWindows(name: string, now: number): void {
+  for (let i = 0; i < STATS_TIERS.length; i++) {
+    try {
+      finalizeElapsedTier(name, i, now);
+    } catch (e: unknown) {
+      console.warn("[stats] elapsed-window finalization failed:", e instanceof Error ? e.message : String(e));
+    }
+  }
+}
+
+function finalizeElapsedTier(name: string, tierIdx: number, now: number): void {
+  const tier = STATS_TIERS[tierIdx];
+  const cur = Math.floor(now / tier.windowMs) * tier.windowMs;
+  // Windows at or before the latest stored point either have one or
+  // were empty when sealed; only windows after it can be missing, and
+  // children older than it were already counted into later windows
+  // live (late items accumulate into the current bucket), so reading
+  // from the latest point cannot double-count them.
+  const latest = latestPersistedTs(name, tier, now);
+  const from = latest ?? now - tier.retentionDays * 86_400_000;
+  if (from >= cur) return;
+  // Children in [from, cur), grouped by the window of this tier
+  // they belong to (floor by this tier's window, as the live cascade
+  // does). For tier 0 the children are raw samples; above that,
+  // child-tier points — re-read from disk so points this pass
+  // finalized for the tier below count.
+  const buckets = new Map<number, StatsBucket>();
+  const addChild = (windowStart: number, child: AggSet): void => {
+    if (windowStart >= cur) return;
+    let bucket = buckets.get(windowStart);
+    if (bucket === undefined) {
+      bucket = newBucket(windowStart);
+      buckets.set(windowStart, bucket);
+    }
+    feedBucket(bucket, child);
+  };
+  if (tierIdx === 0) {
+    for (const s of readRawRange(name, from, cur)) {
+      const ms = Date.parse(s.ts);
+      if (!Number.isFinite(ms)) continue;
+      addChild(Math.floor(ms / tier.windowMs) * tier.windowMs, sampleToAgg(s));
+    }
+  } else {
+    const childTier = STATS_TIERS[tierIdx - 1];
+    for (const p of readRollupRange(name, childTier, from, cur)) {
+      const ms = Date.parse(p.ts);
+      if (!Number.isFinite(ms)) continue;
+      addChild(Math.floor(ms / tier.windowMs) * tier.windowMs, pointToAgg(p));
+    }
+  }
+  if (buckets.size === 0) return;
+  const persisted = new Set<number>();
+  for (const p of readRollupRange(name, tier, from, cur)) persisted.add(Date.parse(p.ts));
+  const starts = [...buckets.keys()].sort((a, b) => a - b);
+  for (const windowStart of starts) {
+    if (persisted.has(windowStart)) continue;
+    const bucket = buckets.get(windowStart);
+    if (bucket === undefined) continue;
+    const point = finalizeBucket(bucket, tier.windowMs);
+    if (point.count === 0) continue;
+    appendRollupPointAllowingGzip(name, tier, point);
+    persisted.add(windowStart);
   }
 }
 
