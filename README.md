@@ -72,7 +72,7 @@ History points (`history[]` in `GET /stats/:container`) carry average, min, and 
 | Metric prefix | Meaning |
 |---|---|
 | `usage`, `working_set`, `anon`, `file`, `inactive_file`, `limit` | Memory bytes (working set = usage minus inactive file cache, as `docker stats` reports MEM USAGE) |
-| `usage_ratio` | Working set / limit, `null` when the container has no explicit memory cap |
+| `usage_ratio` | Working set / limit, `null` when the container has no explicit memory cap. Not the figure `pressure_threshold_ratio` applies to: the alarm uses unreclaimable memory (see `MEMORY_PRESSURE_RATIO` under Environment Variables), which is lower whenever active file cache is large |
 | `cpu` | CPU % (nominal single-core %, Docker's `docker stats` calculation) |
 | `net_rx_bytes_per_sec`, `net_tx_bytes_per_sec` | Network receive / transmit rate, bytes/s, summed across interfaces |
 | `net_rx_packets_per_sec`, `net_tx_packets_per_sec` | Network receive / transmit rate, packets/s, summed across interfaces |

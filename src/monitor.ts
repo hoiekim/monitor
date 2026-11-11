@@ -1329,8 +1329,9 @@ function inactiveFileBytes(mem: DockerStatsResponse["memory_stats"]): number | n
 }
 
 /**
- * Memory the container can't give back without OOM risk: usage minus inactive
- * file cache, the same figure `docker stats` reports as MEM USAGE. Mirrors the
+ * Usage minus inactive file cache, the same figure `docker stats` reports as
+ * MEM USAGE. Still counts active file cache, so it overstates OOM risk; the
+ * pressure alarm uses `calcUnreclaimableBytes` instead. Mirrors the
  * Docker CLI: `total_inactive_file` if below usage, else `inactive_file` if
  * below usage, else raw usage.
  */
