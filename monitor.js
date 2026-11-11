@@ -1048,8 +1048,9 @@ function inactiveFileBytes(mem) {
     return mem?.stats?.total_inactive_file ?? mem?.stats?.inactive_file ?? null;
 }
 /**
- * Memory the container can't give back without OOM risk: usage minus inactive
- * file cache, the same figure `docker stats` reports as MEM USAGE. Mirrors the
+ * Usage minus inactive file cache, the same figure `docker stats` reports as
+ * MEM USAGE. Still counts active file cache, so it overstates OOM risk; the
+ * pressure alarm uses `calcUnreclaimableBytes` instead. Mirrors the
  * Docker CLI: `total_inactive_file` if below usage, else `inactive_file` if
  * below usage, else raw usage.
  */
@@ -1063,6 +1064,22 @@ function calcWorkingSetBytes(mem) {
     if (inactiveFile !== undefined && inactiveFile < usage)
         return usage - inactiveFile;
     return usage;
+}
+/**
+ * Memory the kernel cannot reclaim before it OOM-kills: usage minus page
+ * cache, adding back shmem/tmpfs (accounted as file cache but not
+ * droppable). Active file cache is reclaimable too, so a read-heavy client
+ * that promotes cache to the active list raises the working set without
+ * bringing the container any closer to OOM. Falls back to the working set
+ * when Docker reports no file-cache breakdown.
+ */
+function calcUnreclaimableBytes(mem) {
+    const usage = mem?.usage ?? 0;
+    const file = mem?.stats?.file ?? mem?.stats?.total_cache;
+    if (file === undefined || file > usage)
+        return calcWorkingSetBytes(mem);
+    const shmem = mem?.stats?.shmem ?? mem?.stats?.total_shmem ?? 0;
+    return usage - file + shmem;
 }
 // Stats polls run every second; a hung socket must fail fast rather than
 // stall the cycle behind the in-flight guard below.
@@ -1104,6 +1121,8 @@ async function pollStatsOnce() {
             // `/stats` reports `null` and the alarm block skips this
             // container consistently.
             const usageRatio = IS_UNLIMITED(limit) ? null : workingSet / limit;
+            const unreclaimable = calcUnreclaimableBytes(body.memory_stats);
+            const pressureRatio = IS_UNLIMITED(limit) ? null : unreclaimable / limit;
             const cpuPercent = calcCpuPercent(body);
             const onlineCpus = body.cpu_stats?.online_cpus;
             if (typeof onlineCpus === "number" && onlineCpus > 0)
@@ -1156,26 +1175,27 @@ async function pollStatsOnce() {
             // threshold for MEMORY_PRESSURE_SUSTAINED_MS of wall-clock time (a
             // poll-count rule would fire on any 3-second spike at 1s polling).
             // Only fires when the container has an explicit memory limit
-            // (usage_ratio non-null). The elapsed check uses `>=` so continued
+            // (pressureRatio non-null). The elapsed check uses `>=` so continued
             // pressure re-attempts the alarm on every subsequent poll —
             // `ALARM_COOLDOWN_MS` gates the actual Discord spam. With `===` a
             // single ping fired once and then stayed silent for the entire
             // pressure episode.
-            if (usageRatio !== null && usageRatio >= MEMORY_PRESSURE_RATIO) {
+            if (pressureRatio !== null && pressureRatio >= MEMORY_PRESSURE_RATIO) {
                 let since = pressureSince[name];
                 if (since === undefined) {
                     since = Date.now();
                     pressureSince[name] = since;
                 }
                 if (Date.now() - since >= MEMORY_PRESSURE_SUSTAINED_MS) {
-                    const pct = Math.round(usageRatio * 100);
+                    const pct = Math.round(pressureRatio * 100);
+                    const unreclaimableMB = Math.round(unreclaimable / 1024 / 1024);
                     const workingSetMB = Math.round(workingSet / 1024 / 1024);
                     const usageMB = Math.round(usage / 1024 / 1024);
                     const limitMB = limit ? Math.round(limit / 1024 / 1024) : "?";
-                    await sendAlarm("MEMORY_PRESSURE", name, `Memory at ${pct}% of container limit (${workingSetMB} MB / ${limitMB} MB working set, ${usageMB} MB with page cache) sustained ${Math.round(MEMORY_PRESSURE_SUSTAINED_MS / 1000)}s+ — OOM likely if trend continues.`);
+                    await sendAlarm("MEMORY_PRESSURE", name, `Memory at ${pct}% of container limit (${unreclaimableMB} MB / ${limitMB} MB not reclaimable, ${workingSetMB} MB working set, ${usageMB} MB with page cache) sustained ${Math.round(MEMORY_PRESSURE_SUSTAINED_MS / 1000)}s+ — OOM likely if trend continues.`);
                 }
             }
-            else if (usageRatio !== null) {
+            else if (pressureRatio !== null) {
                 delete pressureSince[name];
             }
         }
